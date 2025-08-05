@@ -15,8 +15,8 @@ const CONFIG = {
 
     // Endpoint API Pi yang akan diserang secara simultan untuk meningkatkan peluang.
     API_ENDPOINTS: [
-        'https://api.mainnet.minepi.com',
         'https://mainnet.zendshost.id',
+        'https://apimainnet.vercel.app',
         // Anda bisa menambahkan node publik lain jika menemukannya di masa depan
     ],
 
