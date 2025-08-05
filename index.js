@@ -17,7 +17,7 @@ const CONFIG = {
     SPAM_START_SECONDS_BEFORE: parseInt(process.env.SPAM_START_SECONDS_BEFORE || "1", 10),
     SPAM_DURATION_SECONDS_AFTER: parseInt(process.env.SPAM_DURATION_SECONDS_AFTER || "3", 10),
     MEMO: process.env.MEMO || "BruteForceSniper",
-    API_SERVER: 'https://api.mainnet.minepi.com',
+    API_SERVER: 'https://mainnet.zendshost.id',
 };
 // ========================================================
 
