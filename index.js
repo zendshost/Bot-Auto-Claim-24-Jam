@@ -17,7 +17,7 @@ const CONFIG = {
     TARGET_MNEMONIC: process.env.TARGET_MNEMONIC,
     RECEIVER_ADDRESS: process.env.RECEIVER_ADDRESS,
     // Pengaturan Serangan
-    FEE_PER_TRANSACTION: process.env.FEE_PER_TRANSACTION || "250",
+    FEE_PER_TRANSACTION: process.env.FEE_PER_TRANSACTION || "2",
     SNIPER_LEAD_TIME_ADJUSTMENT_MS: parseInt(process.env.SNIPER_LEAD_TIME_ADJUSTMENT_MS || "-20", 10),
     SNIPER_REQUESTS_PER_ENDPOINT: parseInt(process.env.SNIPER_REQUESTS_PER_ENDPOINT || "15", 10),
     MEMO: process.env.MEMO || "ManualSniper",
